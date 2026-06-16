@@ -37,6 +37,8 @@ HOP_BY_HOP = frozenset({
 DSML_BAR = chr(0xFF5C)
 DSML_OPEN = "<" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 DSML_CLOSE = "</" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
+DSML_OPEN_ALT = "<|DSML|tool_calls>"
+DSML_CLOSE_ALT = "</|DSML|tool_calls>"
 
 SECTION_SIZE = 32
 GUARD_SECTIONS = 2
@@ -45,6 +47,7 @@ GUARD_SECTIONS = 2
 def normalize_raw_tool_calls(text):
     """Normalize various DSML/Qwen XML formats to standard <｜DSML｜tool_calls> format."""
     bar = DSML_BAR
+    text = _normalize_dsml_bars(text)
     # Format 1: <DSML>tool_calls> (DSML pseudo-namespace without bars)
     if "<DSML>tool_calls>" in text:
         text = text.replace("<DSML>tool_calls>", "<" + bar + "DSML" + bar + "tool_calls>", 1)
@@ -93,7 +96,12 @@ def make_tool_call(name, arguments, call_id=None):
     }
 
 
+def _normalize_dsml_bars(text):
+    return text.replace(DSML_OPEN_ALT, DSML_OPEN).replace(DSML_CLOSE_ALT, DSML_CLOSE)
+
+
 def has_complete_raw_tool_block(text):
+    text = _normalize_dsml_bars(text)
     if DSML_OPEN in text and DSML_CLOSE in text:
         return True
     if "<DSML>tool_calls>" in text:
@@ -109,6 +117,7 @@ def has_any_dsml_prefix(text):
     """Check if text may contain the start of a raw tool block."""
     if not text:
         return False
+    text = _normalize_dsml_bars(text)
     tail = text[-150:] if len(text) > 150 else text
     if DSML_OPEN[:8] in tail:
         return True
@@ -288,7 +297,7 @@ def _make_content_sse(chunk_id, model, text):
 
 
 def _find_dsml_start(text):
-    """Return the index of the first DSML open marker, or len(text)."""
+    text = _normalize_dsml_bars(text)
     for marker in (DSML_OPEN, "<DSML>tool_calls>", "<tool_calls>", "<tool_call>"):
         i = text.find(marker)
         if i != -1:
@@ -350,21 +359,7 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                     text = delta.get("content", "")
 
                     if reasoning:
-                        if text:
-                            r_delta = {"tool_calls": []}
-                            if delta.get("reasoning"):
-                                r_delta["reasoning"] = delta["reasoning"]
-                            if delta.get("reasoning_content"):
-                                r_delta["reasoning_content"] = delta["reasoning_content"]
-                            r_ev = {
-                                "id": chunk_id,
-                                "object": "chat.completion.chunk",
-                                "model": model,
-                                "choices": [{"index": 0, "delta": r_delta}],
-                            }
-                            yield "data: " + json.dumps(r_ev) + "\n\n"
-                        else:
-                            yield raw_line + "\n\n"
+                        yield raw_line + "\n\n"
                     if not text:
                         if not reasoning and not dsml_mode:
                             yield raw_line + "\n\n"
@@ -407,13 +402,6 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                         yield _make_content_sse(chunk_id, model, s)
                     if unflushed:
                         yield _make_content_sse(chunk_id, model, unflushed)
-                    finish_ev = {
-                        "id": chunk_id,
-                        "object": "chat.completion.chunk",
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": "", "tool_calls": []}, "finish_reason": "stop"}],
-                    }
-                    yield "data: " + json.dumps(finish_ev) + "\n\n"
 
                 yield "data: [DONE]\n\n"
 

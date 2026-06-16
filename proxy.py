@@ -39,10 +39,7 @@ DSML_OPEN = "<" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 DSML_CLOSE = "</" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 
 SECTION_SIZE = 32
-GUARD_SECTIONS = 3
-DSML_OPEN_MARKERS = {DSML_OPEN, "<DSML>tool_calls>", "<tool_calls>", "<tool_call>"}
-DSML_OPEN_PREFIXES = {DSML_OPEN[:8], "<DSML>", "<tool_cal"}
-
+GUARD_SECTIONS = 2
 
 
 def normalize_raw_tool_calls(text):
@@ -104,6 +101,22 @@ def has_complete_raw_tool_block(text):
     if "<tool_calls>" in text and "</tool_calls>" in text:
         return True
     if "<tool_call>" in text and "</tool_call>" in text:
+        return True
+    return False
+
+
+def has_any_dsml_prefix(text):
+    """Check if text may contain the start of a raw tool block."""
+    if not text:
+        return False
+    tail = text[-150:] if len(text) > 150 else text
+    if DSML_OPEN[:8] in tail:
+        return True
+    if "<DSML>" in tail or "<DSML:" in tail:
+        return True
+    if "<tool_calls" in tail:
+        return True
+    if "<tool_call" in tail:
         return True
     return False
 
@@ -275,6 +288,7 @@ def _make_content_sse(chunk_id, model, text):
 
 
 def _find_dsml_start(text):
+    """Return the index of the first DSML open marker, or len(text)."""
     for marker in (DSML_OPEN, "<DSML>tool_calls>", "<tool_calls>", "<tool_call>"):
         i = text.find(marker)
         if i != -1:
@@ -282,14 +296,7 @@ def _find_dsml_start(text):
     return len(text)
 
 
-def has_dsml_open(text):
-    for m in DSML_OPEN_MARKERS:
-        if m in text:
-            return True
-    return False
-
-
-async def stream_proxy(upstream_req, forwarded_for=""):
+async def stream_with_sections(upstream_req, forwarded_for=""):
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
     model = upstream_req.get("model", "deepseek")
 
@@ -298,8 +305,8 @@ async def stream_proxy(upstream_req, forwarded_for=""):
         buffer = ""
         unflushed = ""
         pending = []
-        tool_mode = False
-        role_yielded = False
+        dsml_mode = False
+        content_collected = False
 
         req_headers = {"Accept": "text/event-stream"}
         if forwarded_for:
@@ -336,86 +343,79 @@ async def stream_proxy(upstream_req, forwarded_for=""):
                         model = ev["model"]
 
                     if "role" in delta:
-                        if not role_yielded:
-                            yield raw_line + "\n\n"
-                            role_yielded = True
+                        yield raw_line + "\n\n"
                         continue
 
                     reasoning = delta.get("reasoning", "") or delta.get("reasoning_content", "")
                     text = delta.get("content", "")
 
-                    # Reasoning → yield immediately (real-time thinking)
                     if reasoning:
                         if text:
-                            rd = {"tool_calls": []}
+                            r_delta = {"tool_calls": []}
                             if delta.get("reasoning"):
-                                rd["reasoning"] = delta["reasoning"]
+                                r_delta["reasoning"] = delta["reasoning"]
                             if delta.get("reasoning_content"):
-                                rd["reasoning_content"] = delta["reasoning_content"]
-                            yield "data: " + json.dumps({
+                                r_delta["reasoning_content"] = delta["reasoning_content"]
+                            r_ev = {
                                 "id": chunk_id,
                                 "object": "chat.completion.chunk",
                                 "model": model,
-                                "choices": [{"index": 0, "delta": rd}],
-                            }) + "\n\n"
+                                "choices": [{"index": 0, "delta": r_delta}],
+                            }
+                            yield "data: " + json.dumps(r_ev) + "\n\n"
                         else:
                             yield raw_line + "\n\n"
-
                     if not text:
-                        if not reasoning:
+                        if not reasoning and not dsml_mode:
                             yield raw_line + "\n\n"
-                        continue
-
-                    if tool_mode:
-                        buffer += text
                         continue
 
                     buffer += text
-                    unflushed += text
+                    content_collected = True
 
+                    if dsml_mode:
+                        if has_complete_raw_tool_block(buffer):
+                            idx = _find_dsml_start(buffer)
+                            if idx > 0:
+                                yield _make_content_sse(chunk_id, model, buffer[:idx])
+                            tcs = parse_raw_tool_calls(normalize_raw_tool_calls(buffer))
+                            if tcs:
+                                for tc in build_stream_tool_call_chunks(tcs, chunk_id, model):
+                                    yield "data: " + json.dumps(tc) + "\n\n"
+                            return
+                        continue
+
+                    if has_any_dsml_prefix(buffer):
+                        dsml_mode = True
+                        continue
+
+                    unflushed += text
                     while len(unflushed) >= SECTION_SIZE:
-                        section = unflushed[:SECTION_SIZE]
+                        pending.append(unflushed[:SECTION_SIZE])
                         unflushed = unflushed[SECTION_SIZE:]
-                        pending.append(section)
                         if len(pending) > GUARD_SECTIONS:
-                            if has_dsml_open(buffer):
-                                tool_mode = True
-                                break
                             yield _make_content_sse(chunk_id, model, pending.pop(0))
 
-        # Stream ended — flush remaining
-        if tool_mode:
-            non_flushed = "".join(pending) + unflushed
-            if has_complete_raw_tool_block(buffer):
-                idx = _find_dsml_start(buffer)
-                total = len(buffer)
-                flushed = total - len(non_flushed)
-                pre = max(0, idx - flushed)
-                if pre > 0 and pre <= len(non_flushed):
-                    yield _make_content_sse(chunk_id, model, non_flushed[:pre])
-                tcs = parse_raw_tool_calls(normalize_raw_tool_calls(buffer))
-                if tcs:
-                    for tc in build_stream_tool_call_chunks(tcs, chunk_id, model):
-                        yield "data: " + json.dumps(tc) + "\n\n"
-            else:
-                for s in pending:
-                    yield _make_content_sse(chunk_id, model, s)
-                if unflushed:
-                    yield _make_content_sse(chunk_id, model, unflushed)
-        else:
-            for s in pending:
-                yield _make_content_sse(chunk_id, model, s)
-            if unflushed:
-                yield _make_content_sse(chunk_id, model, unflushed)
+                # Stream ended
+                if dsml_mode:
+                    if content_collected:
+                        idx = _find_dsml_start(buffer)
+                        if idx > 0:
+                            yield _make_content_sse(chunk_id, model, buffer[:idx])
+                else:
+                    for s in pending:
+                        yield _make_content_sse(chunk_id, model, s)
+                    if unflushed:
+                        yield _make_content_sse(chunk_id, model, unflushed)
+                    finish_ev = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": "", "tool_calls": []}, "finish_reason": "stop"}],
+                    }
+                    yield "data: " + json.dumps(finish_ev) + "\n\n"
 
-        finish_ev = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "model": model,
-            "choices": [{"index": 0, "delta": {"content": "", "tool_calls": []}, "finish_reason": "stop"}],
-        }
-        yield "data: " + json.dumps(finish_ev) + "\n\n"
-        yield "data: [DONE]\n\n"
+                yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -459,7 +459,8 @@ async def proxy(request: Request):
                     timeout=None,
                 )
             return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
-        return await stream_proxy(j, client_host)
+        log.info("RESPONSE: streaming via stream_with_sections")
+        return await stream_with_sections(j, client_host)
 
     async with httpx.AsyncClient() as client:
         upstream_resp = await client.post(

@@ -39,6 +39,70 @@ DSML_OPEN = "<" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 DSML_CLOSE = "</" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 DSML_OPEN_ALT = "<|DSML|tool_calls>"
 DSML_CLOSE_ALT = "</|DSML|tool_calls>"
+DSML_TAG_PREFIX = "<" + DSML_BAR + "DSML" + DSML_BAR
+DSML_CLOSE_PREFIX = "</" + DSML_BAR + "DSML" + DSML_BAR
+DSML_TAG_PREFIX_ALT = "<|DSML|"
+DSML_CLOSE_PREFIX_ALT = "</|DSML|"
+
+RAW_TOOL_OPEN_MARKERS = (
+    DSML_OPEN,
+    "<DSML>tool_calls>",
+    "<tool_calls>",
+    "<tool_calls",
+    "<tool_call>",
+    "<tool_call",
+)
+
+RAW_TOOL_FRAGMENT_MARKERS = RAW_TOOL_OPEN_MARKERS + (
+    DSML_CLOSE,
+    DSML_TAG_PREFIX + "invoke",
+    DSML_TAG_PREFIX + "parameter",
+    DSML_TAG_PREFIX + "system-reminder",
+    DSML_CLOSE_PREFIX + "invoke",
+    DSML_CLOSE_PREFIX + "parameter",
+    DSML_CLOSE_PREFIX + "tool_calls",
+    DSML_CLOSE_PREFIX + "system-reminder",
+    "<DSML:",
+    "</DSML:",
+    "<|DSML|invoke",
+    "<|DSML|parameter",
+    "<|DSML|system-reminder",
+    "</|DSML|invoke",
+    "</|DSML|parameter",
+    "</|DSML|tool_calls",
+    "</|DSML|system-reminder",
+    "<dcp-system-reminder>",
+    "</dcp-system-reminder>",
+    "<dcp-message-id>",
+    "</dcp-message-id>",
+    "</tool_calls>",
+    "</tool_call>",
+)
+
+INTERNAL_LEAK_SENTINELS = (
+    "Active compressed blocks in this session:",
+    "If your selected compression range includes any listed block",
+    "required placeholder exactly once in the summary using",
+)
+
+_INTERNAL_ARTIFACT_BLOCK_PATTERNS = (
+    re.compile(
+        r"<dcp-system-reminder\b[^>]*>.*?(?:</dcp-system-reminder>|</\uff5cDSML\uff5csystem-reminder>|</\|DSML\|system-reminder>)",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<system-reminder\b[^>]*>.*?</system-reminder>",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<(?:\uff5cDSML\uff5c|\|DSML\|)system-reminder\b[^>]*>.*?</(?:\uff5cDSML\uff5c|\|DSML\|)system-reminder>",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<dcp-message-id\b[^>]*>.*?</dcp-message-id>",
+        re.DOTALL,
+    ),
+)
 
 SECTION_SIZE = 32
 GUARD_SECTIONS = 2
@@ -97,7 +161,16 @@ def make_tool_call(name, arguments, call_id=None):
 
 
 def _normalize_dsml_bars(text):
-    return text.replace(DSML_OPEN_ALT, DSML_OPEN).replace(DSML_CLOSE_ALT, DSML_CLOSE)
+    return (
+        text.replace(DSML_OPEN_ALT, DSML_OPEN)
+        .replace(DSML_CLOSE_ALT, DSML_CLOSE)
+        .replace(DSML_TAG_PREFIX_ALT + "invoke", DSML_TAG_PREFIX + "invoke")
+        .replace(DSML_TAG_PREFIX_ALT + "parameter", DSML_TAG_PREFIX + "parameter")
+        .replace(DSML_TAG_PREFIX_ALT + "system-reminder", DSML_TAG_PREFIX + "system-reminder")
+        .replace(DSML_CLOSE_PREFIX_ALT + "invoke", DSML_CLOSE_PREFIX + "invoke")
+        .replace(DSML_CLOSE_PREFIX_ALT + "parameter", DSML_CLOSE_PREFIX + "parameter")
+        .replace(DSML_CLOSE_PREFIX_ALT + "system-reminder", DSML_CLOSE_PREFIX + "system-reminder")
+    )
 
 
 def has_complete_raw_tool_block(text):
@@ -113,20 +186,43 @@ def has_complete_raw_tool_block(text):
     return False
 
 
+def _first_marker_index(text, markers):
+    indexes = [idx for marker in markers if (idx := text.find(marker)) != -1]
+    return min(indexes) if indexes else -1
+
+
+def _orphan_fragment_start(text, marker_idx):
+    for sentinel in INTERNAL_LEAK_SENTINELS:
+        idx = text.rfind(sentinel, 0, marker_idx)
+        if idx != -1:
+            return text.rfind("\n", 0, idx) + 1
+    return 0
+
+
+def find_raw_tool_start(text):
+    text = _normalize_dsml_bars(text)
+    open_idx = _first_marker_index(text, RAW_TOOL_OPEN_MARKERS)
+    fragment_idx = _first_marker_index(text, RAW_TOOL_FRAGMENT_MARKERS)
+    if open_idx != -1 and (fragment_idx == -1 or open_idx <= fragment_idx):
+        return open_idx
+    if fragment_idx != -1:
+        return _orphan_fragment_start(text, fragment_idx)
+    return len(text)
+
+
 def has_any_dsml_prefix(text):
-    """Check if text may contain the start of a raw tool block."""
     if not text:
         return False
     text = _normalize_dsml_bars(text)
+    for marker in RAW_TOOL_FRAGMENT_MARKERS:
+        if marker in text:
+            return True
     tail = text[-150:] if len(text) > 150 else text
-    if DSML_OPEN[:8] in tail:
-        return True
-    if "<DSML>" in tail or "<DSML:" in tail:
-        return True
-    if "<tool_calls" in tail:
-        return True
-    if "<tool_call" in tail:
-        return True
+    for marker in RAW_TOOL_FRAGMENT_MARKERS:
+        max_size = min(len(tail), len(marker) - 1)
+        for size in range(max_size, 2, -1):
+            if marker.startswith(tail[-size:]):
+                return True
     return False
 
 
@@ -239,6 +335,127 @@ def convert_non_streaming_response(body):
     return body
 
 
+def _strip_internal_artifacts_from_history_text(text):
+    cleaned = text
+    for pattern in _INTERNAL_ARTIFACT_BLOCK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned
+
+
+def _sanitize_content_text_parts(content):
+    if isinstance(content, str):
+        cleaned = _strip_internal_artifacts_from_history_text(content)
+        return cleaned, cleaned != content
+    if not isinstance(content, list):
+        return content, False
+    changed = False
+    new_content = []
+    for part in content:
+        if not isinstance(part, dict):
+            new_content.append(part)
+            continue
+        text_key = None
+        for candidate in ("text", "input_text"):
+            if isinstance(part.get(candidate), str):
+                text_key = candidate
+                break
+        if text_key is None:
+            new_content.append(part)
+            continue
+        cleaned = _strip_internal_artifacts_from_history_text(part[text_key])
+        if cleaned != part[text_key]:
+            changed = True
+            if not cleaned.strip():
+                continue
+            new_part = dict(part)
+            new_part[text_key] = cleaned
+            new_content.append(new_part)
+        else:
+            new_content.append(part)
+    return new_content, changed
+
+
+def _sanitize_chat_internal_artifact_history(payload):
+    if not isinstance(payload, dict):
+        return
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    changed_parts = 0
+    removed_messages = 0
+    sanitized_messages = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized_messages.append(message)
+            continue
+        content = message.get("content")
+        cleaned_content, changed = _sanitize_content_text_parts(content)
+        if not changed:
+            sanitized_messages.append(message)
+            continue
+        changed_parts += 1
+        if isinstance(cleaned_content, str) and not cleaned_content.strip():
+            removed_messages += 1
+            continue
+        if isinstance(cleaned_content, list) and not cleaned_content:
+            removed_messages += 1
+            continue
+        new_message = dict(message)
+        new_message["content"] = cleaned_content
+        sanitized_messages.append(new_message)
+    if changed_parts or removed_messages:
+        payload["messages"] = sanitized_messages
+        log.warning(
+            "sanitized internal artifact history removed=%s changed=%s",
+            removed_messages, changed_parts,
+        )
+
+
+def _normalize_assistant_messages(messages):
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            has_text_or_tool = False
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                t = part.get("type")
+                if t == "tool_use":
+                    has_text_or_tool = True
+                    break
+                if t == "text" and str(part.get("text") or "").strip():
+                    has_text_or_tool = True
+                    break
+            if not has_text_or_tool:
+                content.append({"type": "text", "text": "."})
+            continue
+        if not content and not msg.get("tool_calls"):
+            msg["content"] = "."
+
+
+def _drop_empty_tools(payload):
+    if not isinstance(payload, dict):
+        return
+    if isinstance(payload.get("tools"), list) and not payload["tools"]:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+    optional_params = payload.get("optional_params")
+    if isinstance(optional_params, dict):
+        if isinstance(optional_params.get("tools"), list) and not optional_params["tools"]:
+            optional_params.pop("tools", None)
+
+
+def _disable_responses_reasoning_merge(payload):
+    if not isinstance(payload, dict):
+        return
+    payload["merge_reasoning_content_in_choices"] = False
+    optional_params = payload.get("optional_params")
+    if isinstance(optional_params, dict):
+        optional_params["merge_reasoning_content_in_choices"] = False
+
+
 def sse_json(line):
     prefix = "data: "
     if not line.startswith(prefix):
@@ -311,12 +528,7 @@ def _make_content_sse(chunk_id, model, text):
 
 
 def _find_dsml_start(text):
-    text = _normalize_dsml_bars(text)
-    for marker in (DSML_OPEN, "<DSML>tool_calls>", "<tool_calls>", "<tool_call>"):
-        i = text.find(marker)
-        if i != -1:
-            return i
-    return len(text)
+    return find_raw_tool_start(text)
 
 
 async def stream_with_sections(upstream_req, forwarded_for=""):
@@ -485,8 +697,12 @@ async def proxy(request: Request):
     stream = False
     try:
         j = json.loads(body_bytes)
+        if j:
+            _sanitize_chat_internal_artifact_history(j)
+            _normalize_assistant_messages(j.get("messages"))
+            _drop_empty_tools(j)
+            _disable_responses_reasoning_merge(j)
         if j and "tools" in j and isinstance(j["tools"], list):
-            # 過濾只保留 type 是 function 的工具，避免 vLLM / llama.cpp 拋出 400 錯誤
             j["tools"] = [t for t in j["tools"] if isinstance(t, dict) and t.get("type") == "function"]
             if not j["tools"]:
                 j.pop("tools")

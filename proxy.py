@@ -567,7 +567,9 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
         buffer = ""
         unflushed_text = ""
         pending = []
+        usage_chunk = None
         dsml_mode = False
+        tool_calls_emitted = False
         content_collected = False
         thinking_state = 0  # 0: not started, 1: thinking, 2: finished
 
@@ -585,6 +587,12 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
 
                 choices = ev.get("choices", [])
                 if not choices:
+                    # llama-server sends the OpenAI usage chunk (empty choices,
+                    # a "usage" object, and "timings") here when the request sets
+                    # stream_options.include_usage. Keep it and re-emit it before
+                    # [DONE]; dropping it is why OpenCode showed no token stats.
+                    if ev.get("usage") is not None:
+                        usage_chunk = ev
                     continue
 
                 delta = choices[0].get("delta", {})
@@ -593,6 +601,11 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                     chunk_id = ev["id"]
                 if ev.get("model"):
                     model = ev["model"]
+
+                # After a DSML tool block we keep draining the upstream stream
+                # only to reach its usage chunk; suppress any trailing content.
+                if tool_calls_emitted:
+                    continue
 
                 if "role" in delta:
                     yield raw_line + "\n\n"
@@ -639,7 +652,10 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                                 yield "data: " + json.dumps(tc) + "\n\n"
                         else:
                             log.warning("parse_raw_tool_calls returned empty for DSML block")
-                        return
+                        # Do not stop here: keep reading so the upstream usage
+                        # chunk (empty choices) is captured and re-emitted below.
+                        tool_calls_emitted = True
+                        continue
                     continue
 
                 if has_any_dsml_prefix(buffer):
@@ -660,6 +676,16 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                         yield _make_content_sse(chunk_id, model, pending.pop(0))
 
             # Stream ended
+            if tool_calls_emitted:
+                # The tool-call chunks already carried finish_reason=tool_calls;
+                # emit only the usage chunk (if any) and the terminator.
+                if usage_chunk is not None:
+                    usage_chunk["id"] = chunk_id
+                    usage_chunk["model"] = model
+                    yield "data: " + json.dumps(usage_chunk) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
             if thinking_state == 1:
                 unflushed_text += "\n</think>\n"
                 thinking_state = 2
@@ -677,12 +703,19 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                 if unflushed_text:
                     yield _make_content_sse(chunk_id, model, unflushed_text)
 
-            yield "data: " + json.dumps({
+            final = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "model": model,
                 "choices": [{"index": 0, "delta": {"content": "", "tool_calls": []}, "finish_reason": "stop"}],
-            }) + "\n\n"
+            }
+            if usage_chunk is not None:
+                final["usage"] = usage_chunk["usage"]
+            yield "data: " + json.dumps(final) + "\n\n"
+            if usage_chunk is not None:
+                usage_chunk["id"] = chunk_id
+                usage_chunk["model"] = model
+                yield "data: " + json.dumps(usage_chunk) + "\n\n"
             yield "data: [DONE]\n\n"
         finally:
             await resp.aclose()

@@ -602,7 +602,7 @@ def _make_content_sse(chunk_id, model, text):
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "model": model,
-        "choices": [{"index": 0, "delta": {"content": text, "tool_calls": []}}],
+        "choices": [{"index": 0, "delta": {"content": text}}],
     }, ensure_ascii=False) + "\n\n"
 
 
@@ -615,7 +615,7 @@ def _make_reasoning_sse(chunk_id, model, text):
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "model": model,
-        "choices": [{"index": 0, "delta": {"reasoning_content": text, "tool_calls": []}}],
+        "choices": [{"index": 0, "delta": {"reasoning_content": text}}],
     }, ensure_ascii=False) + "\n\n"
 
 

@@ -41,7 +41,7 @@ The proxy sits between OpenCode and the LLM backend (e.g. vLLM, llama.cpp). It i
 - **DeepSeek DSML** — Detects and converts both `<name>/<parameters>` and `<invoke>/<parameter>` formats
 - **Qwen XML** — Detects and converts `<tool_call>` blocks
 - **vLLM compat** — Strips spurious empty `tool_calls: []` arrays that vLLM sends on every content chunk
-- **Reasoning content** — Accumulates `reasoning`/`reasoning_content` fields and still catches tool calls within them
+- **Reasoning content** — Preserves `reasoning`/`reasoning_content` in its own delta field (never merges it into `content`) and still catches tool calls within it
 - **Chunked streaming** — Streams function arguments in small chunks so OpenCode receives progressive JSON
 - **Native passthrough** — If the upstream already outputs standard `delta.tool_calls`, passes it through unchanged
 - **SSE compression fix** — Strips `Accept-Encoding` header to prevent upstream GZIP/Deflate from breaking the stream parser
@@ -145,7 +145,7 @@ WantedBy=multi-user.target
 2. Each SSE chunk is inspected:
    - Empty `tool_calls: []` from vLLM are stripped
    - Role-only and empty-content chunks are cleaned up
-   - `content` and `reasoning`/`reasoning_content` fields are accumulated into a raw buffer
+   - `content` and `reasoning`/`reasoning_content` fields are buffered for tool-call detection; each field is emitted back in its own delta
 3. When the raw buffer contains a complete DSML or Qwen XML tool call block, the proxy:
    - Parses the block into structured `tool_calls`
    - Emits a role chunk, then function name + chunked argument chunks, then a final `finish_reason: "tool_calls"` chunk

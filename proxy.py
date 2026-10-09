@@ -610,6 +610,65 @@ def _find_dsml_start(text):
     return find_raw_tool_start(text)
 
 
+def _make_reasoning_sse(chunk_id, model, text):
+    return "data: " + json.dumps({
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{"index": 0, "delta": {"reasoning_content": text, "tool_calls": []}}],
+    }, ensure_ascii=False) + "\n\n"
+
+
+def _segment_sse(kind, text, chunk_id, model):
+    if kind == "reasoning":
+        return _make_reasoning_sse(chunk_id, model, text)
+    return _make_content_sse(chunk_id, model, text)
+
+
+def _segments_append(segments, kind, text):
+    """Append text to a list of (kind, text) segments, merging same-kind runs."""
+    if not text:
+        return
+    if segments and segments[-1][0] == kind:
+        segments[-1] = (kind, segments[-1][1] + text)
+    else:
+        segments.append((kind, text))
+
+
+def _segments_len(segments):
+    return sum(len(text) for _, text in segments)
+
+
+def _segments_pop_prefix(segments, n):
+    """Remove and return the first n characters as a list of (kind, text)."""
+    out = []
+    remaining = n
+    while remaining > 0 and segments:
+        kind, text = segments[0]
+        if len(text) <= remaining:
+            out.append((kind, text))
+            segments.pop(0)
+            remaining -= len(text)
+        else:
+            out.append((kind, text[:remaining]))
+            segments[0] = (kind, text[remaining:])
+            remaining = 0
+    return out
+
+
+def _emit_segments(segments, chunk_id, model):
+    """Yield SSE lines for a flat list of (kind, text) segments."""
+    for kind, text in segments:
+        yield _segment_sse(kind, text, chunk_id, model)
+
+
+def _emit_sections(sections, chunk_id, model):
+    """Yield SSE lines for a list of sections, each a list of (kind, text)."""
+    for section in sections:
+        for kind, text in section:
+            yield _segment_sse(kind, text, chunk_id, model)
+
+
 async def stream_with_sections(upstream_req, forwarded_for="", upstream_headers=None, upstream=None):
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
     model = upstream_req.get("model", "deepseek")
@@ -650,13 +709,16 @@ async def stream_with_sections(upstream_req, forwarded_for="", upstream_headers=
     async def generate():
         nonlocal chunk_id, model
         buffer = ""
-        unflushed_text = ""
+        # Un-emitted text, kept as ordered (kind, text) segments so reasoning and
+        # content stay in their own fields. kind is "reasoning" or "content".
+        unflushed = []
+        # Sections already cut out of `unflushed` but held back by the guard.
+        # Each section is a list of (kind, text) segments.
         pending = []
         usage_chunk = None
         dsml_mode = False
         tool_calls_emitted = False
         content_collected = False
-        thinking_state = 0  # 0: not started, 1: thinking, 2: finished
 
         try:
             async for raw_line in resp.aiter_lines():
@@ -706,31 +768,20 @@ async def stream_with_sections(upstream_req, forwarded_for="", upstream_headers=
                         yield raw_line + "\n\n"
                     continue
 
-                # Format chunk with think tags if transitioning
-                chunk_text = ""
-                if is_reason:
-                    if thinking_state == 0:
-                        chunk_text += "<think>\n"
-                        thinking_state = 1
-                    chunk_text += raw_chunk_text
-                else:
-                    if thinking_state == 1:
-                        chunk_text += "\n</think>\n"
-                        thinking_state = 2
-                    chunk_text += raw_chunk_text
-
-                buffer += chunk_text
+                # Keep the reasoning/content split: emit each chunk in its own
+                # field instead of merging reasoning into content. OpenCode (and
+                # any OpenAI-compatible client) reads `reasoning_content`.
+                kind = "reasoning" if is_reason else "content"
+                buffer += raw_chunk_text
                 content_collected = True
 
                 if dsml_mode:
                     if has_complete_raw_tool_block(buffer):
                         idx = _find_dsml_start(buffer)
                         if idx > 0:
-                            prefix = buffer[:idx]
-                            if thinking_state == 1:
-                                prefix += "\n</think>\n"
-                                thinking_state = 2
-                            yield _make_content_sse(chunk_id, model, prefix)
+                            for s in _emit_segments(unflushed, chunk_id, model):
+                                yield s
+                            unflushed.clear()
                         tcs = parse_raw_tool_calls(normalize_raw_tool_calls(buffer))
                         if tcs:
                             for tc in build_stream_tool_call_chunks(tcs, chunk_id, model):
@@ -745,20 +796,20 @@ async def stream_with_sections(upstream_req, forwarded_for="", upstream_headers=
 
                 if has_any_dsml_prefix(buffer):
                     dsml_mode = True
-                    for p in pending:
-                        yield _make_content_sse(chunk_id, model, p)
+                    for s in _emit_sections(pending, chunk_id, model):
+                        yield s
                     pending.clear()
-                    if unflushed_text:
-                        yield _make_content_sse(chunk_id, model, unflushed_text)
-                        unflushed_text = ""
+                    for s in _emit_segments(unflushed, chunk_id, model):
+                        yield s
+                    unflushed.clear()
                     continue
 
-                unflushed_text += chunk_text
-                while len(unflushed_text) >= SECTION_SIZE:
-                    pending.append(unflushed_text[:SECTION_SIZE])
-                    unflushed_text = unflushed_text[SECTION_SIZE:]
+                _segments_append(unflushed, kind, raw_chunk_text)
+                while _segments_len(unflushed) >= SECTION_SIZE:
+                    pending.append(_segments_pop_prefix(unflushed, SECTION_SIZE))
                     if len(pending) > GUARD_SECTIONS:
-                        yield _make_content_sse(chunk_id, model, pending.pop(0))
+                        for s in _emit_sections([pending.pop(0)], chunk_id, model):
+                            yield s
 
             # Stream ended
             if tool_calls_emitted:
@@ -771,22 +822,23 @@ async def stream_with_sections(upstream_req, forwarded_for="", upstream_headers=
                 yield "data: [DONE]\n\n"
                 return
 
-            if thinking_state == 1:
-                unflushed_text += "\n</think>\n"
-                thinking_state = 2
-
             if dsml_mode:
                 if content_collected:
                     idx = _find_dsml_start(buffer)
                     if idx > 0:
-                        yield _make_content_sse(chunk_id, model, buffer[:idx])
+                        for s in _emit_sections(pending, chunk_id, model):
+                            yield s
+                        pending.clear()
+                        for s in _emit_segments(unflushed, chunk_id, model):
+                            yield s
+                        unflushed.clear()
                     if not has_complete_raw_tool_block(buffer) and idx < len(buffer):
                         yield _make_content_sse(chunk_id, model, buffer[idx:])
             else:
-                for s in pending:
-                    yield _make_content_sse(chunk_id, model, s)
-                if unflushed_text:
-                    yield _make_content_sse(chunk_id, model, unflushed_text)
+                for s in _emit_sections(pending, chunk_id, model):
+                    yield s
+                for s in _emit_segments(unflushed, chunk_id, model):
+                    yield s
 
             final = {
                 "id": chunk_id,

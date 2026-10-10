@@ -675,11 +675,25 @@ async def stream_with_sections(upstream_req, forwarded_for="", upstream_headers=
     # Route this stream to the caller-chosen upstream (default frontier/UPSTREAM).
     upstream = upstream if upstream is not None else UPSTREAM
 
-    req_headers = {"Accept": "text/event-stream"}
-    if upstream_headers and FORWARD_AUTHORIZATION:
+    # Forward the client's request headers to the upstream, so a header the
+    # caller sets (for example `x-session-id`, which llama-server's
+    # session-keyed save/restore reads) survives the streaming path. The
+    # non-streaming path already forwards every header; the streaming path used
+    # to build a fresh header set and dropped all but Authorization.
+    #
+    # Only the caller's application headers are copied. A content-type and an
+    # accept for the SSE response are forced; the body is re-serialized JSON, so
+    # a copied content-length would be wrong and is skipped with the other
+    # hop-by-hop headers.
+    req_headers = {"Accept": "text/event-stream", "content-type": "application/json"}
+    if upstream_headers:
         for k, v in upstream_headers.items():
-            if k.lower() == "authorization":
-                req_headers["Authorization"] = v
+            lk = k.lower()
+            if lk in ("accept", "content-type", "content-length", "host", "x-forwarded-for"):
+                continue
+            if lk == "authorization" and not FORWARD_AUTHORIZATION:
+                continue
+            req_headers[k] = v
     if forwarded_for:
         req_headers["x-forwarded-for"] = forwarded_for
 

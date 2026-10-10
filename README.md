@@ -45,6 +45,7 @@ The proxy sits between OpenCode and the LLM backend (e.g. vLLM, llama.cpp). It i
 - **Chunked streaming** — Streams function arguments in small chunks so OpenCode receives progressive JSON
 - **Native passthrough** — If the upstream already outputs standard `delta.tool_calls`, passes it through unchanged
 - **SSE compression fix** — Strips `Accept-Encoding` header to prevent upstream GZIP/Deflate from breaking the stream parser
+- **Client header passthrough** — Forwards the caller's application headers (for example `x-session-id`, which llama-server's session-keyed save/restore reads) on both the streaming and the non-streaming path. `content-type`, `accept`, `content-length`, `host` and `x-forwarded-for` are set by the proxy; `authorization` is forwarded only when `FORWARD_AUTHORIZATION` is on.
 
 ## Installation
 
